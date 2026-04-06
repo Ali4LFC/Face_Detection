@@ -59,10 +59,16 @@ class MainWindow(ctk.CTk):
         self.camera_caps = []
         self.canvases = [] # Grid of canvases
         self.last_results = {} # per camera
+        self.alert_history = set() # To avoid duplicate alerts in short time
 
         self.video_active = False
         self.video_thread = None
         self.video_path   = ""
+
+        # Auto-snapshot state
+        self.last_snapshot_time = 0
+        self.snapshot_dir = os.path.join(os.getcwd(), "data", "alerts")
+        os.makedirs(self.snapshot_dir, exist_ok=True)
 
         # ── Tkinter variables ──────────────────────────────────
         self.status_var    = ctk.StringVar(value="Initializing AI Core...")
@@ -157,11 +163,21 @@ class MainWindow(ctk.CTk):
         )
         self.conf_val_label.grid(row=10, column=0, padx=20, pady=0, sticky="e")
 
+        # Privacy Mode Switch
+        self.privacy_var = ctk.BooleanVar(value=False)
+        self.privacy_switch = ctk.CTkSwitch(
+            self.sidebar, text="PRIVACY MODE",
+            variable=self.privacy_var,
+            command=self._on_privacy_change,
+            progress_color=ACCENT_BLUE
+        )
+        self.privacy_switch.grid(row=11, column=0, padx=20, pady=(20, 0), sticky="w")
+
         # Status badge
         self.status_container = ctk.CTkFrame(
             self.sidebar, corner_radius=10, fg_color="#111111",
         )
-        self.status_container.grid(row=11, column=0, padx=20, pady=20, sticky="ew")
+        self.status_container.grid(row=12, column=0, padx=20, pady=20, sticky="ew")
 
         self.status_label = ctk.CTkLabel(
             self.status_container, textvariable=self.status_var,
@@ -252,6 +268,11 @@ class MainWindow(ctk.CTk):
         if self.detector:
             self.detector.confidence_threshold = int(value) / 100.0
 
+    def _on_privacy_change(self):
+        if self.detector:
+            self.detector.privacy_mode = self.privacy_var.get()
+            self.status_var.set(f"Privacy Mode: {'ON' if self.detector.privacy_mode else 'OFF'}")
+
     # ══════════════════════════════════════════════════════════
     # Camera Management
     # ══════════════════════════════════════════════════════════
@@ -326,54 +347,114 @@ class MainWindow(ctk.CTk):
         return found
 
     def _camera_worker(self, cam_idx):
-        """Worker for each camera stream."""
-        cap = cv2.VideoCapture(cam_idx)  # default backend
-        if not cap.isOpened():
-            self.after(0, lambda: self.status_var.set(f"Err: Cam {cam_idx} not found"))
-            return
-
-        self.camera_caps.append(cap)
-        # Optimized resolution for MVP performance
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-
+        """Worker for each camera stream. Robust and multi-threaded."""
+        cap = None
         try:
-            canvas_idx = self.current_camera_indices.index(cam_idx)
-        except (ValueError, AttributeError):
-            cap.release()
-            return
-        
-        while self.camera_active:
-            ret, frame = cap.read()
-            if not ret: break
+            cap = cv2.VideoCapture(cam_idx)
+            if not cap.isOpened():
+                self.after(0, lambda: self.status_var.set(f"Err: Cam {cam_idx} not found"))
+                return
 
-            if self.detector:
-                # OPTIMIZATION: Process detection
-                result = self.detector.detect(frame)
-                annotated = self.detector.draw_detections(frame, result)
-                self.last_results[canvas_idx] = (annotated, result)
-                
-                # Update UI (only if active)
-                if self.camera_active:
-                    self.after(0, self._update_camera_frame, canvas_idx, annotated, result)
-            else:
-                self.after(0, self._display_frame, canvas_idx, frame)
+            self.camera_caps.append(cap)
+            # Optimized resolution for MVP performance
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+            # Store local copy of camera indices for this worker
+            worker_indices = list(self.current_camera_indices)
+            canvas_idx = worker_indices.index(cam_idx)
             
-            # Control FPS (approx 30fps)
-            time.sleep(0.01)
+            while self.camera_active:
+                ret, frame = cap.read()
+                if not ret:
+                    # Retry once if connection lost
+                    time.sleep(0.5)
+                    ret, frame = cap.read()
+                    if not ret: break
 
-        cap.release()
+                if self.detector:
+                    try:
+                        # Process detection in worker thread
+                        result = self.detector.detect(frame)
+                        annotated = self.detector.draw_detections(frame, result)
+                        self.last_results[canvas_idx] = (annotated, result)
+                        
+                        # Update UI (thread-safe)
+                        if self.camera_active:
+                            self.after(0, self._update_camera_frame, canvas_idx, annotated, result)
+                    except Exception as e:
+                        print(f"[AI] Error in detector on CAM {cam_idx}: {e}")
+                else:
+                    self.after(0, self._display_frame, canvas_idx, frame)
+                
+                # Control FPS (approx 30fps) to avoid CPU overloading
+                time.sleep(0.01)
+
+        except Exception as e:
+            print(f"[CAM] Critical worker error on CAM {cam_idx}: {e}")
+        finally:
+            if cap: cap.release()
+            print(f"[CAM] Stopped worker for CAM {cam_idx}")
 
     def _update_camera_frame(self, canvas_idx, image, result):
         if not self.camera_active: return
         self._display_frame(canvas_idx, image)
         
+        # Check for new alerts
+        cam_id = self.current_camera_indices[canvas_idx] if canvas_idx < len(self.current_camera_indices) else canvas_idx
+        
+        if result.danger_detected:
+            # Combine all threats into a message
+            threats = []
+            if result.dangerous_objects:
+                threats.extend(result.dangerous_objects)
+            if result.dangerous_actions:
+                threats.extend(result.dangerous_actions)
+            
+            if threats:
+                msg = ", ".join(set(threats)).upper()
+                self._add_alert(cam_id, msg)
+                
+                # Auto-snapshot (limit to once per 5 seconds per threat event)
+                curr_t = time.time()
+                if curr_t - self.last_snapshot_time > 5:
+                    self._save_snapshot(image, cam_id, msg)
+                    self.last_snapshot_time = curr_t
+
         # Aggregate stats from all cameras for the panel
         total_people = sum(r[1].person_count for r in self.last_results.values() if r)
         max_latency = max(r[1].processing_time_ms for r in self.last_results.values() if r)
         
         self.card_people.configure(text=str(total_people))
         self.card_perf.configure(text=f"{max_latency:.0f}")
+
+        # Update global alert badge
+        any_danger = any(r[1].danger_detected for r in self.last_results.values() if r)
+        if any_danger:
+            self.alert_label.configure(text="🚨 THREAT DETECTED!", text_color=ACCENT_RED)
+            self.alert_frame.configure(fg_color="#331111")
+        elif total_people > 0:
+            self.alert_label.configure(text="✅ MONITORING ACTIVE", text_color=ACCENT_GREEN)
+            self.alert_frame.configure(fg_color="#112211")
+        else:
+            self.alert_label.configure(text="SYSTEM READY", text_color=TEXT_SUBTLE)
+            self.alert_frame.configure(fg_color="#18181b")
+
+    def _save_snapshot(self, image, cam_id, threat_msg):
+        """Automatically save a snapshot when a threat is detected."""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"alert_cam{cam_id}_{timestamp}.jpg"
+        filepath = os.path.join(self.snapshot_dir, filename)
+        
+        # Save in background thread to avoid UI lag
+        def _save_worker():
+            try:
+                cv2.imwrite(filepath, image)
+                print(f"[SYSTEM] Auto-snapshot saved: {filename}")
+            except Exception as e:
+                print(f"[SYSTEM] Error saving snapshot: {e}")
+        
+        threading.Thread(target=_save_worker, daemon=True).start()
 
     def _display_frame(self, canvas_idx, image):
         if canvas_idx >= len(self.canvases): return
@@ -480,19 +561,22 @@ class MainWindow(ctk.CTk):
     # ══════════════════════════════════════════════════════════
 
     def _build_stats_panel(self):
-        self.stats_panel = ctk.CTkFrame(self, width=320, corner_radius=0)
+        self.stats_panel = ctk.CTkFrame(self, width=420, corner_radius=0)
         self.stats_panel.grid(row=0, column=2, sticky="nsew")
+        self.stats_panel.grid_propagate(False) # Ensure width stays fixed
 
         ctk.CTkLabel(
             self.stats_panel, text="LIVE STATISTICS",
             font=ctk.CTkFont(size=16, weight="bold"),
         ).pack(pady=(30, 20), padx=20, anchor="w")
 
+        # Top stats cards
         self.card_people = self._create_card(self.stats_panel, "People Total", "0")
         self.card_perf   = self._create_card(self.stats_panel, "Max Latency (ms)", "—")
 
-        self.alert_frame = ctk.CTkFrame(self.stats_panel, height=80, fg_color="#18181b")
-        self.alert_frame.pack(fill="x", padx=20, pady=20)
+        # Global alert badge
+        self.alert_frame = ctk.CTkFrame(self.stats_panel, height=60, fg_color="#18181b")
+        self.alert_frame.pack(fill="x", padx=20, pady=10)
         self.alert_frame.pack_propagate(False)
 
         self.alert_label = ctk.CTkLabel(
@@ -501,6 +585,70 @@ class MainWindow(ctk.CTk):
             text_color=ACCENT_GREEN,
         )
         self.alert_label.pack(expand=True)
+
+        # ── ALERTS FEED ──────────────────────────────────────
+        ctk.CTkLabel(
+            self.stats_panel, text="DETECTION ALERTS",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color=TEXT_SUBTLE,
+        ).pack(pady=(20, 10), padx=20, anchor="w")
+
+        self.alert_scroll = ctk.CTkScrollableFrame(
+            self.stats_panel, fg_color="#0f0f12", corner_radius=10,
+            label_text=None, height=400
+        )
+        self.alert_scroll.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+
+        self.btn_clear_alerts = ctk.CTkButton(
+            self.stats_panel, text="CLEAR HISTORY",
+            fg_color="transparent", border_width=1,
+            height=30, font=ctk.CTkFont(size=11),
+            command=self._clear_alerts
+        )
+        self.btn_clear_alerts.pack(pady=(0, 20), padx=20)
+
+    def _add_alert(self, cam_idx, description):
+        """Add a new alert item to the scrollable feed with auto-scroll and full visibility."""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        alert_text = f"[{timestamp}] CAM #{cam_idx}: {description}"
+        
+        # Debounce: don't add same alert if it happened within last 3 seconds
+        alert_key = (cam_idx, description)
+        if alert_key in self.alert_history:
+            return
+        
+        self.alert_history.add(alert_key)
+        self.after(3000, lambda: self.alert_history.discard(alert_key))
+
+        # Container for each alert card
+        alert_item = ctk.CTkFrame(self.alert_scroll, fg_color="#3a1a1a", corner_radius=8, border_width=1, border_color="#ef4444")
+        alert_item.pack(fill="x", pady=5, padx=5)
+
+        # Label with wrapping - increased wraplength for wider panel
+        lbl = ctk.CTkLabel(
+            alert_item, text=alert_text,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="#fca5a5", 
+            wraplength=350, # Sufficient for 420px width minus paddings
+            justify="left"
+        )
+        lbl.pack(pady=10, padx=12, anchor="w")
+
+        # Auto-scroll to the bottom of the feed
+        self.after(100, lambda: self._scroll_to_bottom())
+
+    def _scroll_to_bottom(self):
+        """Scroll the alerts container to the very bottom."""
+        try:
+            # CustomTkinter ScrollableFrame has an internal canvas
+            self.alert_scroll._parent_canvas.yview_moveto(1.0)
+        except Exception:
+            pass
+
+    def _clear_alerts(self):
+        for child in self.alert_scroll.winfo_children():
+            child.destroy()
+        self.alert_history.clear()
 
     def _create_card(self, parent, title: str, value: str, color=None):
         card = ctk.CTkFrame(parent, fg_color=BG_CARD, height=100)

@@ -26,6 +26,7 @@ INPUT_SIZE           = 640           # Optimized for speed
 
 # ── Action Detection thresholds ───────────────────────────────
 ACTION_HANDS_UP_THRESH = 0.1         # Height difference for hands up
+ACTION_FALLING_RATIO   = 0.6         # Width/Height ratio to detect falling
 
 # ── COCO class IDs ────────────────────────────────────────────
 PERSON_CLASS_ID = 0

@@ -23,6 +23,7 @@ from app.config import (
     COCO_NAMES,
     INPUT_SIZE,
     ACTION_HANDS_UP_THRESH,
+    ACTION_FALLING_RATIO,
     DETECT_ALL_COCO_OBJECTS,
 )
 
@@ -84,6 +85,7 @@ class ObjectDetector:
 
     def __init__(self):
         self.confidence_threshold = CONFIDENCE_THRESHOLD
+        self.privacy_mode = False
         
         # Using Nano models for speed
         from app.config import YOLO_MODEL_NANO, YOLO_POSE_MODEL
@@ -187,6 +189,16 @@ class ObjectDetector:
             if (l_wrist_y > 0 and l_wrist_y < nose_y - margin) or (r_wrist_y > 0 and r_wrist_y < nose_y - margin):
                 actions.append("HANDS UP")
 
+        # Falling Detection (Heuristic: Width > Height * 1.5 or horizontal alignment)
+        # We check aspect ratio and if the head is low relative to the body
+        aspect_ratio = det.w / max(1.0, det.h)
+        if aspect_ratio > 1.4:
+            # Check if person is on the ground
+            # Using hips (11, 12) vs nose (0) or ankles (15, 16)
+            l_hip_y, r_hip_y = kp[11][1], kp[12][1]
+            if (l_hip_y > 0 and abs(nose_y - l_hip_y) < det.h * 0.4) or (r_hip_y > 0 and abs(nose_y - r_hip_y) < det.h * 0.4):
+                actions.append("FALLING")
+
         return actions
 
     def draw_detections(self, image: np.ndarray, result: DetectionResult) -> np.ndarray:
@@ -242,6 +254,8 @@ class ObjectDetector:
 
             if det.keypoints is not None:
                 self._draw_skeleton(canvas, det.keypoints)
+                if self.privacy_mode:
+                    self._blur_face(canvas, det.keypoints)
 
             cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 2)
 
@@ -286,6 +300,27 @@ class ObjectDetector:
                 cv2.line(image, pt1, pt2, COLOR_SKELETON, 2)
         for x, y in kp:
             if x > 0: cv2.circle(image, (int(x), int(y)), 3, COLOR_KEYPOINT, -1)
+
+    def _blur_face(self, image: np.ndarray, kp: np.ndarray):
+        """Blur face area using pose keypoints (0-4: nose, eyes, ears)."""
+        face_kpts = kp[:5]
+        valid_face = face_kpts[face_kpts[:, 0] > 0]
+        if len(valid_face) < 2: return
+
+        # Calculate bounding box for the face area
+        fx1, fy1 = np.min(valid_face, axis=0).astype(int)
+        fx2, fy2 = np.max(valid_face, axis=0).astype(int)
+        
+        # Add padding
+        pad = int(max(fx2 - fx1, fy2 - fy1) * 0.5)
+        fx1, fy1 = max(0, fx1 - pad), max(0, fy1 - pad)
+        fx2, fy2 = min(image.shape[1], fx2 + pad), min(image.shape[0], fy2 + pad)
+
+        if fx2 > fx1 and fy2 > fy1:
+            face_roi = image[fy1:fy2, fx1:fx2]
+            # Strong blur for privacy
+            blurred = cv2.GaussianBlur(face_roi, (51, 51), 0)
+            image[fy1:fy2, fx1:fx2] = blurred
 
     def _draw_info_panel(self, image: np.ndarray, result: DetectionResult) -> np.ndarray:
         panel_h = 80
