@@ -82,7 +82,8 @@ The system will automatically adjust the grid layout based on the number of came
 
 ## Author 👤
 
-**Ali** — *Development and Integration*
+**Ali** - *Development and Integration*
+**Ayaulym&** - *Design and Development*
 
 ---
 *Project developed as part of the "Computer Information Processing" course (Zhukabayeva T. K.)*
